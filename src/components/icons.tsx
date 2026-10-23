@@ -19,6 +19,12 @@ export const Plus = ({ size = 20, className }: P) => (
   </svg>
 );
 
+export const X = ({ size = 18, className }: P) => (
+  <svg {...base(size)} className={className} aria-hidden>
+    <path d="M18 6 6 18M6 6l12 12" />
+  </svg>
+);
+
 export const Play = ({ size = 20, className }: P) => (
   <svg {...base(size)} className={className} aria-hidden>
     <path d="M7 4.5v15l12-7.5z" />
