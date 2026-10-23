@@ -291,6 +291,13 @@ export function splitArgs(text: string): ArgToken[] {
   return out;
 }
 
+/** 去掉可能存在的 `ffmpeg` 前缀，得到真正传给 exec 的参数 */
+export function argsOf(text: string): string[] {
+  const toks = splitArgs(text);
+  if (toks.length > 0 && toks[0].value === 'ffmpeg') return toks.slice(1).map((t) => t.value);
+  return toks.map((t) => t.value);
+}
+
 /** 已知「不吃值」的开关参数：判断输出名时要跳过这类 flag 后面的 token */
 const SWITCH_FLAGS = new Set(DEFS.filter((d) => d.type === 'switch').map((d) => d.flag));
 
