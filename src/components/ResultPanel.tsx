@@ -6,7 +6,7 @@ interface Props {
   result: RunResult | null;
 }
 
-/** 完成后页面内预览 + 下载按钮；浏览器播不了的格式给一句说明，不自动下载 */
+/** 完成后页面内预览 + 下载；浏览器播不了的格式给一句说明，不自动下载 */
 export function ResultPanel({ result }: Props) {
   const kind = useMemo(() => (result ? kindOf(result.name) : 'none'), [result]);
   const mime = useMemo(() => (result ? mimeOf(result.name) : ''), [result]);
@@ -18,9 +18,7 @@ export function ResultPanel({ result }: Props) {
     return probe.canPlayType(mime) !== '';
   }, [result, kind, mime]);
 
-  if (!result) {
-    return <p className="hint">跑完之后这里直接出预览，点下载再拿走，不自动下载。</p>;
-  }
+  if (!result) return null;
 
   return (
     <div className="result" data-testid="result">
@@ -31,9 +29,7 @@ export function ResultPanel({ result }: Props) {
       </div>
 
       {!playable ? (
-        <p className="hint warn">
-          浏览器播不了 {result.name}（MKV / AVI / FLV 常见），用下面的下载按钮拿走再看。
-        </p>
+        <p className="hint warn">浏览器播不了 {result.name}（MKV / AVI / FLV 常见），用下面的下载按钮拿走再看。</p>
       ) : null}
 
       <div className="result-meta">
