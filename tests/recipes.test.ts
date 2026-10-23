@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { computeRules } from '../src/lib/rules';
-import { RECIPES, applyRecipe } from '../src/lib/recipes';
+import { RECIPES, applyRecipe, recipeArgs } from '../src/lib/recipes';
 import { buildCommand } from '../src/lib/command';
 
 describe('快速配方', () => {
@@ -65,5 +65,19 @@ describe('快速配方', () => {
     const { chips, outputName } = applyRecipe(gif, 'clip.mp4');
     expect(outputName).toBe('clip.gif');
     expect(chips.map((c) => c.flag)).toEqual(['scale', 'fps']);
+  });
+});
+
+describe('recipeArgs（插入命令框用）', () => {
+  it('滤镜必须包成 -vf / -af，不能裸插', () => {
+    expect(recipeArgs(RECIPES.find((r) => r.id === 'gif')!)).toBe('-vf scale=480:-1,fps=12');
+    expect(recipeArgs(RECIPES.find((r) => r.id === 'audio')!)).toBe('-vn -c:a libmp3lame -b:a 128k -ac 1');
+  });
+
+  it('压缩配方的参数都带前缀且不含输入输出名', () => {
+    const s = recipeArgs(RECIPES.find((r) => r.id === 'compress')!);
+    expect(s).toBe('-c:v libx264 -crf 28 -b:a 128k -vf scale=1280:-1');
+    expect(s).not.toContain('input.');
+    expect(s).not.toContain('out.mp4');
   });
 });
