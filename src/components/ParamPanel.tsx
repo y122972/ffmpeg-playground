@@ -1,17 +1,14 @@
 import { useMemo, useState } from 'react';
-import type { Chip, Def } from '../types';
+import type { Def } from '../types';
 import { FIRST_SCREEN, groupedAll } from '../lib/params';
-import { chipFromDef } from '../lib/command';
 import { Modal } from './Modal';
 import { ChevronDown, ChevronUp, Search } from './icons';
 
 interface Props {
   open: boolean;
   onClose: () => void;
-  /** 编辑已有 chip，null 表示新增 */
-  editing: Chip | null;
-  /**新增或替换一个 chip */
-  onCommit: (chip: Chip, editingId: string | null) => void;
+  /** 确认后回调：要插入的片段，以及它是普通参数还是滤镜（滤镜要按流决定 -vf / -af） */
+  onInsert: (snippet: string, kind: 'param' | 'vfilter' | 'afilter') => void;
 }
 
 function matches(def: Def, q: string): boolean {
@@ -24,16 +21,12 @@ function matches(def: Def, q: string): boolean {
   );
 }
 
-export function ParamPanel({ open, onClose, editing, onCommit }: Props) {
-  // 打开时的初始态直接从 props 推导，不靠 effect 复位（调用方用 key 重挂载来清状态）
+export function ParamPanel({ open, onClose, onInsert }: Props) {
+  // 每次打开都是干净状态：初始态直接推导，不靠 effect 复位
   const [showAll, setShowAll] = useState(false);
   const [query, setQuery] = useState('');
-  const [current, setCurrent] = useState<Def | null>(() => {
-    if (!editing?.defId) return null;
-    const all = [...FIRST_SCREEN, ...groupedAll().flatMap((g) => g.items)];
-    return all.find((d) => d.id === editing.defId) ?? null;
-  });
-  const [value, setValue] = useState(() => editing?.value ?? '');
+  const [current, setCurrent] = useState<Def | null>(null);
+  const [value, setValue] = useState('');
   const [custom, setCustom] = useState(false);
 
   const groups = useMemo(() => groupedAll(), []);
@@ -44,12 +37,6 @@ export function ParamPanel({ open, onClose, editing, onCommit }: Props) {
     const items = groups.flatMap((g) => g.items).filter((d) => matches(d, q));
     return { items };
   }, [groups, q]);
-
-  const openDetail = (def: Def) => {
-    setCurrent(def);
-    setValue(def.type === 'switch' ? '' : (editing?.value ?? ''));
-    setCustom(false);
-  };
 
   const listView = () => {
     if (searchResults) {
@@ -98,6 +85,12 @@ export function ParamPanel({ open, onClose, editing, onCommit }: Props) {
         </button>
       </div>
     );
+  };
+
+  const openDetail = (def: Def) => {
+    setCurrent(def);
+    setValue('');
+    setCustom(false);
   };
 
   const detail = () => {
@@ -180,10 +173,16 @@ export function ParamPanel({ open, onClose, editing, onCommit }: Props) {
     return value.trim() !== '';
   };
 
+  /** 生成要插入命令框的文本片段 */
+  const snippetOf = (d: Def, v: string): string => {
+    if (d.group === 'vfilter' || d.group === 'afilter') return v ? `${d.flag}=${v}` : d.flag;
+    return v ? `${d.flag} ${v}` : d.flag;
+  };
+
   return (
     <Modal
       open={open}
-      title={current ? (editing ? '编辑参数' : '取个值') : editing ? '编辑参数' : '添加参数'}
+      title={current ? '取个值' : '添加参数'}
       onClose={onClose}
       footer={
         current ? (
@@ -197,14 +196,13 @@ export function ParamPanel({ open, onClose, editing, onCommit }: Props) {
               disabled={!canCommit()}
               onClick={() => {
                 if (!current) return;
-                onCommit(
-                  chipFromDef(current, current.type === 'switch' ? '' : value.trim()),
-                  editing?.id ?? null,
-                );
+                const v = current.type === 'switch' ? '' : value.trim();
+                const g = current.group;
+                onInsert(snippetOf(current, v), g === 'vfilter' || g === 'afilter' ? g : 'param');
                 onClose();
               }}
             >
-              {editing ? '保存' : '插入'}
+              插入
             </button>
           </>
         ) : null
