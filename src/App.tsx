@@ -1,21 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Chip, RuleItem, RunPhase, RunResult } from './types';
-import { buildCommand, chipFromDef, inputChip, parseCommandText } from './lib/command';
+import type { RuleItem, RunPhase, RunResult } from './types';
+import {
+  argsOf,
+  hasFlag,
+  insertBeforeToken,
+  insertFilterIntoChain,
+  outputNameOf,
+  outputTokenIndex,
+  parseCommandText,
+  replaceFlagValue,
+  replaceOutputExt,
+} from './lib/command';
 import { computeRules } from './lib/rules';
-import { applyRecipe, RECIPES } from './lib/recipes';
+import { applyRecipe, recipeArgs, RECIPES, type Recipe } from './lib/recipes';
 import { DEF_MAP } from './lib/params';
 import { defaultOutputName, formatBytes, inputNameFor, mimeOf } from './lib/format';
 import { engine, type CoreLoadState } from './lib/ffmpegEngine';
-import { FilePicker } from './components/FilePicker';
-import { ChipList } from './components/ChipList';
-import { CommandBar } from './components/CommandBar';
-import { OutputBar } from './components/OutputBar';
+import { FileRow } from './components/FileRow';
+import { CommandBox } from './components/CommandBox';
 import { ParamPanel } from './components/ParamPanel';
+import { RecipeModal } from './components/RecipeModal';
 import { ResultPanel } from './components/ResultPanel';
 import { Info, Play, Plus, Stop, Warn } from './components/icons';
 
-const MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024; // ffmpeg.wasm 硬上限
-const BIG_INPUT_BYTES = 400 * 1024 * 1024; // wasm 内存余量有限，超过就开始容易 OOM
+const MAX_INPUT_BYTES = 2 * 1024 * 1024 * 1024;
+const BIG_INPUT_BYTES = 400 * 1024 * 1024;
 const MAX_LOGS = 400;
 
 interface LogLine {
@@ -23,14 +32,24 @@ interface LogLine {
   type: string;
 }
 
+/** 库定义 → 命令片段（滤镜不带 -vf，由插入时决定并进哪条链） */
+function snippetOfDef(defId: string, value: string): string {
+  const d = DEF_MAP[defId];
+  if (!d) return '';
+  if (d.group === 'vfilter' || d.group === 'afilter') return value ? `${d.flag}=${value}` : d.flag;
+  return value ? `${d.flag} ${value}` : d.flag;
+}
+
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
-  const [chips, setChips] = useState<Chip[]>([]);
-  const [inputName, setInputName] = useState('input.mp4');
-  const [outputName, setOutputName] = useState('output.mp4');
-  const [panelOpen, setPanelOpen] = useState(false);
-  const [editing, setEditing] = useState<Chip | null>(null);
+  /** 命令就是唯一输入框：由素材生成初始命令，之后完全自由编辑 */
+  const [cmd, setCmd] = useState('');
+  /** 是否还停在初始生成的那条命令（决定配方是整体替换还是插入光标处） */
+  const [pristine, setPristine] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [recipeOpen, setRecipeOpen] = useState(false);
 
   const [phase, setPhase] = useState<RunPhase>('idle');
   const [progress, setProgress] = useState(0);
@@ -38,112 +57,148 @@ export default function App() {
   const [logs, setLogs] = useState<LogLine[]>([]);
   const [result, setResult] = useState<RunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [logOpen, setLogOpen] = useState(true);
+  const [logOpen, setLogOpen] = useState(false);
   const abortRef = useRef(false);
   const logBoxRef = useRef<HTMLDivElement>(null);
+  const cmdRef = useRef<HTMLTextAreaElement>(null);
 
   const appendLog = useCallback((line: LogLine) => {
     setLogs((prev) => [...prev.slice(-MAX_LOGS), line]);
   }, []);
 
-  /** 选素材：默认输入名 input.<原后缀>，输出名 <上传名>_<时间戳>.mp4 */
   const pickFile = useCallback((f: File) => {
-    const input = inputNameFor(f.name);
     setFile(f);
-    setInputName(input);
-    setOutputName(defaultOutputName(f.name));
-    setChips([]);
+    setCmd(`-i ${inputNameFor(f.name)} ${defaultOutputName(f.name)}`);
+    setPristine(true);
     setResult(null);
     setError(null);
     setNotice(null);
   }, []);
 
-  const cmd = useMemo(() => buildCommand(chips, inputName, outputName), [chips, inputName, outputName]);
-  const rules: RuleItem[] = useMemo(() => computeRules(chips, cmd.outputName), [chips, cmd.outputName]);
+  /** 手动编辑命令后就不再是「初始状态」 */
+  const editCmd = useCallback((next: string) => {
+    setCmd(next);
+    setPristine(false);
+    setResult(null);
+  }, []);
+
+  const outputName = useMemo(() => outputNameOf(cmd), [cmd]);
+  const rules: RuleItem[] = useMemo(() => {
+    if (!outputName) return [];
+    return computeRules(parseCommandText(cmd, 'input.mp4'), outputName);
+  }, [cmd, outputName]);
+
   const busy = phase === 'loading-core' || phase === 'writing' || phase === 'running';
   const canAbort = phase === 'writing' || phase === 'running';
 
-  // ── chip 操作 ──────────────────────────────────────────
-  const commitChip = (chip: Chip, editingId: string | null) => {
-    setResult(null);
-    if (editingId) {
-      setChips((prev) => prev.map((c) => (c.id === editingId ? { ...chip, id: editingId } : c)));
-    } else {
-      setChips((prev) => [...prev, chip]);
-    }
-  };
+  /** 取输入框当前文本（优先实时值，其次 state） */
+  const cur = useCallback((): string => cmdRef.current?.value ?? cmd, [cmd]);
 
-  const moveChip = (id: string, dir: 'up' | 'down') => {
-    setChips((prev) => {
-      const i = prev.findIndex((c) => c.id === id);
-      const j = i + (dir === 'up' ? -1 : 1);
-      if (i === -1 || j < 0 || j >= prev.length) return prev;
-      const next = [...prev];
-      [next[i], next[j]] = [next[j], next[i]];
-      return next;
+  const focusAt = useCallback((caret: number) => {
+    requestAnimationFrame(() => {
+      const el = cmdRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(caret, caret);
     });
-  };
+  }, []);
 
-  const removeChip = (id: string) => {
-    setResult(null);
-    setChips((prev) => prev.filter((c) => c.id !== id));
-  };
+  /** 插到输出名之前（参数属于输出侧选项，不能落到输出文件后面）；没有输出名就追加 */
+  const insertToken = useCallback(
+    (snippet: string) => {
+      const text = cur();
+      const outIdx = outputTokenIndex(text);
+      const res = insertBeforeToken(text, outIdx === -1 ? argsOf(text).length : outIdx, snippet);
+      editCmd(res.text);
+      focusAt(res.caret);
+    },
+    [editCmd, focusAt, cur],
+  );
 
-  const appendIO = (kind: 'input' | 'output') => {
-    if (chips.some((c) => c.kind === kind)) {
-      setNotice(kind === 'input' ? '素材名已经在列表里了。' : '输出名已经在列表里了。不插的话会自动放在命令末尾。');
-      return;
-    }
-    setChips((prev) => [
-      ...prev,
-      kind === 'input'
-        ? inputChip(inputName)
-        : {
-            id: `${kind}-${Date.now().toString(36)}`,
-            kind,
-            value: outputName,
-            label: '输出',
-          },
-    ]);
-  };
+  /** 在光标处插入（保留用户选中的位置） */
+  const insertAtCursor = useCallback(
+    (snippet: string) => {
+      const el = cmdRef.current;
+      if (!el) {
+        editCmd(`${cur()} ${snippet}`.trim());
+        return;
+      }
+      const start = el.selectionStart ?? el.value.length;
+      const end = el.selectionEnd ?? start;
+      const head = el.value.slice(0, start);
+      const tailText = el.value.slice(end);
+      const lead = head && !/\s$/.test(head) ? ' ' : '';
+      const tail = tailText && !/^\s/.test(tailText) ? ' ' : '';
+      editCmd(`${head}${lead}${snippet}${tail}${tailText}`);
+      focusAt((head + lead + snippet).length);
+    },
+    [editCmd, focusAt, cur],
+  );
 
-  /** 配方：只填参数不跑，方便先看命令 */
-  const runRecipe = (id: string) => {
-    const recipe = RECIPES.find((r) => r.id === id);
-    if (!recipe) return;
-    const applied = applyRecipe(recipe, outputName);
-    setChips(applied.chips);
-    if (applied.outputName !== outputName) setOutputName(applied.outputName);
-    setResult(null);
-    setNotice(
-      applied.outputName !== outputName
-        ? `已填入「${recipe.label}」：${recipe.hint}（输出后缀改为 .${recipe.ext}）`
-        : `已填入「${recipe.label}」：${recipe.hint}`,
-    );
-  };
+  /** 插入参数：滤镜优先并进已有的同流链；没有链就补一条 -vf / -af，绝不裸插 */
+  const insertParam = useCallback(
+    (snippet: string, kind: 'param' | 'vfilter' | 'afilter') => {
+      if (kind !== 'param') {
+        const flag = kind === 'afilter' ? '-af' : '-vf';
+        const merged = insertFilterIntoChain(cur(), flag, snippet);
+        if (merged) {
+          editCmd(merged.text);
+          focusAt(merged.caret);
+          return;
+        }
+        insertToken(`${flag} ${snippet}`);
+        return;
+      }
+      insertAtCursor(snippet);
+    },
+    [editCmd, focusAt, insertAtCursor, insertToken, cur],
+  );
 
-  /** 执行规则里的一键修正 */
-  const applyFix = (rule: RuleItem) => {
-    if (!rule.fix) return;
-    setChips((prev) => {
-      let next = prev.map((c) => {
-        const hit = rule.fix?.setValue?.find((s) => c.kind === 'param' && c.flag === s.flag);
-        return hit ? { ...c, value: hit.value } : c;
-      });
-      const extra = (rule.fix?.add ?? []).map((a) => chipFromDef(DEF_MAP[a.defId], a.value));
-      next = [...next, ...extra];
-      return next;
-    });
-    setNotice(`已应用：${rule.fix.label}`);
-    setResult(null);
-  };
+  const insertInput = useCallback(() => {
+    if (!file || hasFlag(cur(), '-i')) return;
+    insertToken(`-i ${inputNameFor(file.name)}`);
+  }, [file, insertToken, cur]);
 
-  /** 自由输入 → 解析回 chip */
-  const applyManual = (raw: string) => {
-    setChips(parseCommandText(raw, inputName));
-    setResult(null);
-    setNotice('已按这行重新解析。滤镜链会按顺序合回 -vf / -af。');
-  };
+  const insertOutput = useCallback(() => {
+    if (!file || outputNameOf(cur())) return;
+    insertToken(defaultOutputName(file.name));
+  }, [file, insertToken, cur]);
+
+  const applyRecipeToCmd = useCallback(
+    (recipe: Recipe) => {
+      const args = recipeArgs(recipe);
+      const target = applyRecipe(recipe, outputName ?? defaultOutputName(file?.name ?? 'clip.mp4')).outputName;
+
+      if (pristine && file) {
+        setCmd(`-i ${inputNameFor(file.name)} ${args} ${target}`);
+        setPristine(true);
+      } else {
+        insertAtCursor(args);
+        if (recipe.ext) {
+          setCmd((prev) => (outputTokenIndex(prev) === -1 ? prev : replaceOutputExt(prev, recipe.ext!)));
+        }
+      }
+      setNotice(`配方「${recipe.label}」：${recipe.hint}`);
+      setResult(null);
+    },
+    [file, insertAtCursor, outputName, pristine],
+  );
+
+  /** 一键修复：在文本层直接改，不动其他部分 */
+  const applyFix = useCallback(
+    (rule: RuleItem) => {
+      if (!rule.fix) return;
+      let next = cmd;
+      for (const s of rule.fix.setValue ?? []) next = replaceFlagValue(next, s.flag, s.value);
+      for (const a of rule.fix.add ?? []) {
+        const outIdx = outputTokenIndex(next);
+        next = insertBeforeToken(next, outIdx === -1 ? argsOf(next).length : outIdx, snippetOfDef(a.defId, a.value)).text;
+      }
+      editCmd(next);
+      setNotice(`已应用：${rule.fix.label}`);
+    },
+    [cmd, editCmd],
+  );
 
   // ── 运行 ──────────────────────────────────────────────
   const tick = useCallback(() => {
@@ -176,13 +231,16 @@ export default function App() {
 
   const doRun = async () => {
     if (!file) {
-      setError('先选一个素材。');
+      setError('先选素材。');
+      return;
+    }
+    const out = outputNameOf(cmd);
+    if (!out) {
+      setError('命令里没有输出文件名。最后一个不带 - 的参数就是输出名。');
       return;
     }
     if (file.size > MAX_INPUT_BYTES) {
-      setError(
-        `素材 ${formatBytes(file.size)}，超过 ffmpeg.wasm 的 2GB 硬上限，无法在浏览器里处理。先切小。`,
-      );
+      setError(`素材 ${formatBytes(file.size)}，超过 ffmpeg.wasm 的 2GB 硬上限，无法在浏览器里处理。`);
       return;
     }
 
@@ -203,17 +261,16 @@ export default function App() {
       }
 
       setPhase('writing');
-      appendLog({ text: `执行：${cmd.text}`, type: 'info' });
-      const data = await engine.run(cmd.args, cmd.inputName, file, cmd.outputName);
+      appendLog({ text: `执行：ffmpeg ${cmd}`, type: 'info' });
+      const data = await engine.run(argsOf(cmd), inputNameFor(file.name), file, out);
 
-      const outName = cmd.outputName;
-      const blob = new Blob([data], { type: mimeOf(outName) });
+      const blob = new Blob([data], { type: mimeOf(out) });
       const url = URL.createObjectURL(blob);
-      setResult({ name: outName, blob, url, mime: blob.type });
+      setResult({ name: out, blob, url, mime: blob.type });
       setProgress(1);
       setPhase('done');
-      appendLog({ text: `完成：${outName}（${formatBytes(blob.size)}）`, type: 'info' });
-      engine.cleanup(cmd.inputName, outName);
+      appendLog({ text: `完成：${out}（${formatBytes(blob.size)}）`, type: 'info' });
+      engine.cleanup(inputNameFor(file.name), out);
     } catch (err) {
       if (abortRef.current) {
         setPhase('aborted');
@@ -236,20 +293,10 @@ export default function App() {
   const bigFile = file ? file.size > BIG_INPUT_BYTES : false;
   const corePct = core && core.total > 0 ? (core.loaded / core.total) * 100 : null;
 
-  const coreHint = (() => {
-    if (!core) return '下载解码内核…';
-    const loaded = formatBytes(core.loaded);
-    const total = formatBytes(core.total);
-    return corePct === null
-      ? `下载解码内核… 已下载 ${loaded}`
-      : `下载解码内核… ${corePct.toFixed(0)}%（${loaded} / ${total}）`;
-  })();
-
   return (
     <div className="app">
       <header className="head">
         <h1>ffmpeg-playground</h1>
-        <p className="sub">在浏览器里拼 ffmpeg 命令、本地处理素材。不上传，不装东西。</p>
       </header>
 
       {notice ? (
@@ -259,69 +306,36 @@ export default function App() {
         </p>
       ) : null}
 
-      <section className="card">
-        <h2 className="card-title">1. 素材</h2>
-        <FilePicker file={file} onPick={pickFile} onClear={() => { setFile(null); setResult(null); }} />
+      <div className="stack">
+        <FileRow file={file} onPick={pickFile} />
+
         {bigFile ? (
-          <p className="hint warn">
-            素材 {formatBytes(file?.size ?? 0)}，偏大：网页版内存有限，很可能中途失败。建议先用别的工具切小，或者本地用 ffmpeg。
-          </p>
+          <p className="hint warn">素材 {formatBytes(file?.size ?? 0)}，偏大：网页版内存有限，很可能中途失败。</p>
         ) : null}
-      </section>
 
-      <section className="card">
-        <h2 className="card-title">2. 快速配方</h2>
-        <p className="hint">点一下只填参数，不直接跑。你看看命令合不合心意再决定。</p>
-        <div className="recipes">
-          {RECIPES.map((r) => (
-            <button key={r.id} type="button" className="recipe" onClick={() => runRecipe(r.id)} disabled={!file}>
-              <span className="recipe-label">{r.label}</span>
-              <span className="recipe-hint">{r.hint}</span>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section className="card">
-        <div className="card-head">
-          <h2 className="card-title">3. 参数</h2>
-          <button
-            type="button"
-            className="btn primary"
-            onClick={() => {
-              setEditing(null);
-              setPanelOpen(true);
-            }}
-            data-testid="add-param"
-          >
-            <Plus />
-            添加参数
-          </button>
-        </div>
-
-        <ChipList
-          chips={chips}
-          onReorder={(c) => { setChips(c); setResult(null); }}
-          onMove={moveChip}
-          onRemove={removeChip}
-          onEdit={(c) => {
-            setEditing(c);
-            setPanelOpen(true);
-          }}
-          onAppendIO={appendIO}
+        <CommandBox
+          ref={cmdRef}
+          value={cmd}
+          onChange={editCmd}
+          disabled={!file}
+          placeholder={file ? '' : '先选素材，这里会生成一条默认命令'}
         />
 
-        <div className="io-quick">
-          <button type="button" className="btn ghost" onClick={() => appendIO('input')} disabled={!file}>
-            插入素材名
+        <div className="toolbar">
+          <button type="button" className="mini-btn" onClick={() => setPanelOpen(true)} disabled={!file} data-testid="add-param">
+            <Plus size={15} />
+            参数
           </button>
-          <button type="button" className="btn ghost" onClick={() => appendIO('output')} disabled={!file}>
-            插入输出名
+          <button type="button" className="mini-btn" onClick={() => setRecipeOpen(true)} disabled={!file} data-testid="recipes">
+            配方
           </button>
-          <span className="hint">不插也行：素材会自动放在最前面，输出自动放末尾。顺序随便拖，拼错了 ffmpeg 会报错。</span>
+          <button type="button" className="mini-btn" onClick={insertInput} disabled={!file} data-testid="ins-input">
+            输入名
+          </button>
+          <button type="button" className="mini-btn" onClick={insertOutput} disabled={!file} data-testid="ins-output">
+            输出名
+          </button>
         </div>
-
-        <CommandBar text={cmd.text} onApply={applyManual} />
 
         {rules.length > 0 ? (
           <ul className="rules" data-testid="rules">
@@ -338,35 +352,17 @@ export default function App() {
             ))}
           </ul>
         ) : null}
-      </section>
-
-      <section className="card">
-        <h2 className="card-title">4. 输出</h2>
-        <OutputBar
-          value={outputName}
-          onChange={(v) => {
-            setOutputName(v);
-            setResult(null);
-          }}
-          disabled={!file}
-        />
-        <p className="hint">改了后缀只是改容器；容器和编码器不搭的话上面会出现提示，一键换过去。</p>
-      </section>
-
-      <section className="card">
-        <h2 className="card-title">5. 运行</h2>
 
         {phase === 'loading-core' ? (
           <div className="core-load" data-testid="core-load">
             <div className="bar">
-              <div
-                className="bar-fill"
-                style={{ width: `${corePct ?? 6}%`, transition: corePct !== null ? 'width .2s' : 'none' }}
-              />
+              <div className="bar-fill" style={{ width: `${corePct ?? 6}%` }} />
             </div>
             <p className="hint">
-              {coreHint}
-              首次约 32MB（内核本体 32.2MB），之后走缓存。
+              {corePct === null
+                ? '下载内核…'
+                : `下载内核… ${corePct.toFixed(0)}%（${formatBytes(core?.loaded ?? 0)} / ${formatBytes(core?.total ?? 0)}）`}
+              ，首次约 32MB
             </p>
           </div>
         ) : null}
@@ -378,84 +374,56 @@ export default function App() {
         ) : null}
 
         <div className="run-row">
-          <button
-            type="button"
-            className="btn primary big"
-            onClick={doRun}
-            disabled={!file || busy}
-            data-testid="run"
-          >
+          <button type="button" className="btn primary big" onClick={doRun} disabled={!file || busy} data-testid="run">
             <Play />
             {phase === 'running' ? '运行中…' : phase === 'writing' ? '写入素材…' : '开始转换'}
           </button>
-          <button
-            type="button"
-            className="btn ghost"
-            onClick={doAbort}
-            disabled={!canAbort}
-            data-testid="abort"
-          >
+          <button type="button" className="btn ghost" onClick={doAbort} disabled={!canAbort} data-testid="abort">
             <Stop />
             中止
           </button>
         </div>
 
-        {phase === 'aborted' ? (
-          <p className="hint warn" data-testid="aborted-note">
-            已中止。内核被强制关掉，下次运行要重新下载（浏览器有缓存会快很多）。
-          </p>
-        ) : null}
         {error ? (
           <p className="error" data-testid="error">
             {error}
           </p>
         ) : null}
 
-        <button type="button" className="link-btn log-toggle" onClick={() => setLogOpen((v) => !v)}>
-          {logOpen ? '收起日志' : '展开日志'}（{logs.length} 行）
-        </button>
-        {logOpen ? (
-          <div className="logbox" ref={logBoxRef} data-testid="log">
-            {logs.length === 0 ? (
-              <p className="hint">运行后这里滚动显示 ffmpeg 的输出。</p>
-            ) : (
-              logs.map((l, i) => (
-                <p key={i} className={`log ${l.type || 'plain'}`}>
-                  {l.text}
-                </p>
-              ))
-            )}
-          </div>
+        {logs.length > 0 ? (
+          <>
+            <button type="button" className="link-btn log-toggle" onClick={() => setLogOpen((v) => !v)}>
+              {logOpen ? '收起日志' : '展开日志'}（{logs.length} 行）
+            </button>
+            {logOpen ? (
+              <div className="logbox" ref={logBoxRef} data-testid="log">
+                {logs.map((l, i) => (
+                  <p key={i} className={`log ${l.type || 'plain'}`}>
+                    {l.text}
+                  </p>
+                ))}
+              </div>
+            ) : null}
+          </>
         ) : null}
-      </section>
 
-      <section className="card">
-        <h2 className="card-title">6. 结果</h2>
         <ResultPanel result={result} />
-      </section>
+      </div>
 
-      {panelOpen ? (
-        <ParamPanel
-          key={editing?.id ?? 'new-param'}
-          open={panelOpen}
-          onClose={() => {
-            setPanelOpen(false);
-            setEditing(null);
-          }}
-          editing={editing}
-          onCommit={commitChip}
-        />
-      ) : null}
-
-      <footer className="foot">
-        <p>
-          解码内核是 ffmpeg.wasm 单线程版（首次约 32MB，从 CDN 拉取，之后走缓存）。纯静态页面，没有后端。素材
-          <strong>只在你的浏览器里</strong>处理。
-        </p>
-        <p className="foot-meta">
-          部分浏览器对 MKV / AVI / FLV 播不出来，但下载下来的文件本身是好的。
-        </p>
-      </footer>
+      <ParamPanel
+        key={panelOpen ? 'panel-open' : 'panel-closed'}
+        open={panelOpen}
+        onClose={() => setPanelOpen(false)}
+        onInsert={insertParam}
+      />
+      {/* key 随开合变化：每次打开都是干净状态，搜索词不残留 */}
+      <RecipeModal
+        key={recipeOpen ? 'recipe-open' : 'recipe-closed'}
+        open={recipeOpen}
+        onClose={() => setRecipeOpen(false)}
+        onPick={applyRecipeToCmd}
+        recipes={RECIPES}
+      />
     </div>
   );
 }
