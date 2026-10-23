@@ -1,5 +1,5 @@
 import type { Chip, Def } from '../types';
-import { DEF_MAP, isFilterDef } from './params';
+import { DEF_MAP, DEFS, isFilterDef } from './params';
 
 let seq = 0;
 export function nextId(): string {
@@ -248,4 +248,126 @@ export function tokenOf(chip: Chip): string {
     default:
       return '';
   }
+}
+
+// ── 文本级操作：命令就是唯一输入框，插入/替换都在字符层面做 ──────────────
+
+/** 带原文字符偏移的 token（引号内的内容会去掉引号） */
+export interface ArgToken {
+  value: string;
+  start: number;
+  end: number;
+}
+
+/** 按空格切分，尊重引号，并记录每个 token 在原文里的起止位置 */
+export function splitArgs(text: string): ArgToken[] {
+  const out: ArgToken[] = [];
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    while (i < n && /\s/.test(text[i])) i += 1;
+    if (i >= n) break;
+    const start = i;
+    let value = '';
+    let quote: string | null = null;
+    while (i < n) {
+      const ch = text[i];
+      if (quote) {
+        if (ch === quote) quote = null;
+        else value += ch;
+        i += 1;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+        i += 1;
+      } else if (/\s/.test(ch)) {
+        break;
+      } else {
+        value += ch;
+        i += 1;
+      }
+    }
+    out.push({ value, start, end: i });
+  }
+  return out;
+}
+
+/** 已知「不吃值」的开关参数：判断输出名时要跳过这类 flag 后面的 token */
+const SWITCH_FLAGS = new Set(DEFS.filter((d) => d.type === 'switch').map((d) => d.flag));
+
+/** 最后一个非 flag token 就是输出名；没有则 -1。
+ *  会跳过「前一个 token 是吃值的参数」的 token，否则会把 -vf 的值、-crf 的 23 误判成输出名。 */
+export function outputTokenIndex(text: string): number {
+  const toks = splitArgs(text);
+  for (let i = toks.length - 1; i >= 0; i -= 1) {
+    const t = toks[i];
+    if (t.value.startsWith('-')) continue;
+    const prev = toks[i - 1];
+    if (prev && prev.value.startsWith('-') && !SWITCH_FLAGS.has(prev.value)) continue;
+    return i;
+  }
+  return -1;
+}
+
+export function outputNameOf(text: string): string | null {
+  const idx = outputTokenIndex(text);
+  if (idx === -1) return null;
+  return splitArgs(text)[idx].value;
+}
+
+/** 在第 index 个 token 之前插入片段；index 越界则追加到末尾 */
+export function insertBeforeToken(
+  text: string,
+  index: number,
+  snippet: string,
+): { text: string; caret: number } {
+  const toks = splitArgs(text);
+  const pos = index >= toks.length ? text.length : toks[Math.max(0, index)].start;
+  const head = text.slice(0, pos);
+  const lead = head.length > 0 && !/\s$/.test(head) ? ' ' : '';
+  const tail = text.slice(pos);
+  const gap = tail.length > 0 && !/^\s/.test(tail) ? ' ' : '';
+  return { text: head + lead + snippet + gap + tail, caret: (head + lead + snippet + gap).length };
+}
+
+/** 把滤镜片段并进已有的 -vf / -af 链尾；没有这条链就返回 null（调用方自行插入新链） */
+export function insertFilterIntoChain(
+  text: string,
+  flag: '-vf' | '-af',
+  snippet: string,
+): { text: string; caret: number } | null {
+  const re = new RegExp(`(^|\\s)(${flag})(\\s+)("(?:[^"]*)"|\\S+)`);
+  const m = re.exec(text);
+  if (!m) return null;
+  const valueStart = m.index + m[1].length + m[2].length + m[3].length;
+  const valueEnd = valueStart + m[4].length;
+  return {
+    text: text.slice(0, valueEnd) + ',' + snippet + text.slice(valueEnd),
+    caret: valueEnd + snippet.length + 1,
+  };
+}
+
+/** 替换某个参数的值（一键修复用）；找不到 flag 则原样返回 */
+export function replaceFlagValue(text: string, flag: string, newValue: string): string {
+  const re = new RegExp(`(^|\\s)(${flag})(\\s+)("(?:[^"]*)"|\\S+)`);
+  const m = re.exec(text);
+  if (!m) return text;
+  const valueStart = m.index + m[1].length + m[2].length + m[3].length;
+  const valueEnd = valueStart + m[4].length;
+  return text.slice(0, valueStart) + newValue + text.slice(valueEnd);
+}
+
+/** 把输出名的后缀换掉（配方改后缀用） */
+export function replaceOutputExt(text: string, ext: string): string {
+  const toks = splitArgs(text);
+  const idx = outputTokenIndex(text);
+  if (idx === -1) return text;
+  const t = toks[idx];
+  const dot = t.value.lastIndexOf('.');
+  const base = dot === -1 ? t.value : t.value.slice(0, dot);
+  return text.slice(0, t.start) + `${base}.${ext}` + text.slice(t.end);
+}
+
+/** 命令里是否已有某个开关/参数 */
+export function hasFlag(text: string, flag: string): boolean {
+  return splitArgs(text).some((t) => t.value === flag);
 }
