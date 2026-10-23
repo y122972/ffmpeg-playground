@@ -7,9 +7,7 @@ export interface Recipe {
   id: string;
   label: string;
   hint: string;
-  /** 生成的参数 chip。不含输入/输出名——交给 buildCommand 自动放置：
-   *  输入自动放最前，输出自动放末尾。
-   */
+  /** 生成的参数 chip。不含输入/输出名——输入放最前、输出放末尾由调用方处理。 */
   chips: () => Chip[];
   /** 输出后缀变化 */
   ext?: string;
@@ -80,7 +78,7 @@ export const RECIPES: Recipe[] = [
   },
 ];
 
-/** 配方应用后的 chip 列表 + 输出名。chip 里不含输入/输出名，由 buildCommand 自动放置。 */
+/** 配方应用后的 chip 列表 + 输出名。 */
 export function applyRecipe(recipe: Recipe, outputName: string): {
   chips: Chip[];
   outputName: string;
@@ -89,4 +87,28 @@ export function applyRecipe(recipe: Recipe, outputName: string): {
     chips: recipe.chips(),
     outputName: recipe.ext ? withExt(outputName, recipe.ext) : outputName,
   };
+}
+
+/**
+ * 配方 → 可直接插进命令框的参数串。
+ * 滤镜按流合并成 -vf / -af 两条链——裸插 scale=... ffmpeg 根本不认。
+ */
+export function recipeArgs(recipe: Recipe): string {
+  const vf: string[] = [];
+  const af: string[] = [];
+  const plain: string[] = [];
+
+  for (const chip of recipe.chips()) {
+    if (chip.kind === 'filter') {
+      const piece = chip.value ? `${chip.flag ?? ''}=${chip.value}` : (chip.flag ?? '');
+      (chip.stream === 'a' ? af : vf).push(piece);
+    } else {
+      plain.push(chip.value ? `${chip.flag} ${chip.value}` : (chip.flag ?? ''));
+    }
+  }
+
+  const parts = [...plain];
+  if (vf.length > 0) parts.push(`-vf ${vf.join(',')}`);
+  if (af.length > 0) parts.push(`-af ${af.join(',')}`);
+  return parts.join(' ');
 }
