@@ -1,5 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { buildCommand, inputChip, outputChip, parseCommandText, chipFromDef, tokenize } from '../src/lib/command';
+import {
+  argsOf,
+  buildCommand,
+  inputChip,
+  insertBeforeToken,
+  insertFilterIntoChain,
+  outputChip,
+  outputNameOf,
+  outputTokenIndex,
+  parseCommandText,
+  replaceOutputExt,
+  chipFromDef,
+  tokenize,
+} from '../src/lib/command';
 import { DEF_MAP } from '../src/lib/params';
 import { computeRules } from '../src/lib/rules';
 
@@ -147,5 +160,43 @@ describe('computeRules', () => {
 
   it('图片后缀没加 -frames:v 时提醒', () => {
     expect(computeRules([], 'out.png').some((x) => x.id === 'image:frames')).toBe(true);
+  });
+});
+
+describe('文本级操作（命令框即唯一输入）', () => {
+  it('输出名识别：跳过 -vf 的值、-crf 的值，不被 -i 的素材名骗到', () => {
+    expect(outputNameOf('-i input.mp4 -crf 23 out.mp4')).toBe('out.mp4');
+    expect(outputNameOf('-i input.mp4 -vf scale=1280:-1,fps=30 out.mp4')).toBe('out.mp4');
+    expect(outputNameOf('-i input.mp4 -af volume=1.5 out.mp4')).toBe('out.mp4');
+    // 最后一个 token 是滤镜值时，不能把它当成输出名
+    expect(outputNameOf('-i input.mp4 out.mp4 -vf scale=480:-1,fps=12')).toBe('out.mp4');
+    // 开关参数不吃值，后面的 token 仍然是输出名
+    expect(outputNameOf('-i input.mp4 -y out.mp4')).toBe('out.mp4');
+    expect(outputNameOf('-i input.mp4 -crf 23')).toBe(null);
+  });
+
+  it('滤镜并链：已有 -vf 时追加到链尾，不产生第二条链', () => {
+    const r = insertFilterIntoChain('-i input.mp4 -vf scale=1280:-1 out.mp4', '-vf', 'fps=30')!;
+    expect(r.text).toBe('-i input.mp4 -vf scale=1280:-1,fps=30 out.mp4');
+    // 音频滤镜不会误并进 -vf
+    expect(insertFilterIntoChain('-i input.mp4 -vf scale=1280:-1 out.mp4', '-af', 'volume=1.5')).toBe(null);
+  });
+
+  it('参数插在输出名之前（不能落到输出文件后面）', () => {
+    const line = '-i input.mp4 out.mp4 -vf scale=480:-1,fps=12';
+    const idx = outputTokenIndex(line);
+    const res = insertBeforeToken(line, idx, '-crf 28');
+    expect(res.text).toBe('-i input.mp4 -crf 28 out.mp4 -vf scale=480:-1,fps=12');
+  });
+
+  it('replaceOutputExt 只改输出名的后缀，不动滤镜值', () => {
+    expect(replaceOutputExt('-i input.mp4 out.mp4 -vf scale=480:-1,fps=12', 'gif')).toBe(
+      '-i input.mp4 out.gif -vf scale=480:-1,fps=12',
+    );
+    expect(replaceOutputExt('-i input.mp4 -crf 23', 'gif')).toBe('-i input.mp4 -crf 23');
+  });
+
+  it('argsOf 接受带 ffmpeg 前缀的整行', () => {
+    expect(argsOf('ffmpeg -i input.mp4 -crf 23 out.mp4')).toEqual(['-i', 'input.mp4', '-crf', '23', 'out.mp4']);
   });
 });
